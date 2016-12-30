@@ -35,7 +35,7 @@ import kenlm
 
 import nlc_model
 import nlc_data
-from util import pair_iter
+from util import get_tokenizer
 
 tf.app.flags.DEFINE_float("learning_rate", 0.001, "Learning rate.")
 tf.app.flags.DEFINE_float("learning_rate_decay_factor", 0.95, "Learning rate decays by this much.")
@@ -76,11 +76,6 @@ def create_model(session, vocab_size, forward_only):
   return model
 
 
-def get_tokenizer(FLAGS):
-  tokenizer = nlc_data.char_tokenizer if FLAGS.tokenizer.lower() == 'char' else nlc_data.basic_tokenizer
-  return tokenizer
-
-
 def tokenize(sent, vocab, depth=FLAGS.num_layers):
   align = pow(2, depth - 1)
   token_ids = nlc_data.sentence_to_token_ids(sent, vocab, get_tokenizer(FLAGS))
@@ -117,9 +112,25 @@ def lm_rank(strs, probs):
   if lm is None:
     return strs[0]
   a = FLAGS.alpha
-  rescores = [(1-a)*p + a*lm.score(s) for (s, p) in zip(strs, probs)]
-  rerank = [rs[0] for rs in sorted(enumerate(rescores), key=lambda x:x[1])]
-  return strs[rerank[-1]]
+  lmscores = [lm.score(s)/(1+len(s.split())) for s in strs]
+  probs = [ p / (len(s)+1) for (s, p) in zip(strs, probs) ]
+  for (s, p, l) in zip(strs, probs, lmscores):
+    print(s, p, l)
+
+  rescores = [(1 - a) * p + a * l for (l, p) in zip(lmscores, probs)]
+  rerank = [rs[0] for rs in sorted(enumerate(rescores), key=lambda x: x[1])]
+  generated = strs[rerank[-1]]
+  lm_score = lmscores[rerank[-1]]
+  nw_score = probs[rerank[-1]]
+  score = rescores[rerank[-1]]
+  return generated #, score, nw_score, lm_score
+
+#  if lm is None:
+#    return strs[0]
+#  a = FLAGS.alpha
+#  rescores = [(1-a)*p + a*lm.score(s) for (s, p) in zip(strs, probs)]
+#  rerank = [rs[0] for rs in sorted(enumerate(rescores), key=lambda x:x[1])]
+#  return strs[rerank[-1]]
 
 def lm_rank_score(strs, target, probs):
   """
