@@ -115,7 +115,7 @@ class NLCModel(object):
       self.updates = opt.apply_gradients(
         zip(clipped_gradients, params), global_step=self.global_step)
 
-    self.saver = tf.train.Saver(tf.all_variables(), max_to_keep=FLAGS.keep)
+    self.saver = tf.train.Saver(tf.global_variables(), max_to_keep=FLAGS.keep)  # write_version=tf.train.SaverDef.V1
 
   def setup_embeddings(self):
     with vs.variable_scope("embeddings"):
@@ -142,7 +142,7 @@ class NLCModel(object):
     if self.num_layers > 1:
       self.decoder_cell = rnn_cell.GRUCell(self.size)
     self.attn_cell = GRUCellAttn(self.size, self.encoder_output, scope="DecoderAttnCell")
-
+    i = -1
     with vs.variable_scope("Decoder"):
       inp = self.decoder_inputs
       for i in xrange(self.num_layers - 1):
@@ -165,6 +165,7 @@ class NLCModel(object):
     inp = decoder_inputs
 
     with vs.variable_scope("Decoder", reuse=True):
+      i = -1
       for i in xrange(self.num_layers - 1):
         with vs.variable_scope("DecoderCell%d" % i) as scope:
           inp, state_output = self.decoder_cell(inp, decoder_state_input[i])
@@ -267,8 +268,6 @@ class NLCModel(object):
     return tf.nn.dropout(inp, self.keep_prob)
 
   def downscale(self, inp, mask):
-    return inp, mask
-
     with vs.variable_scope("Downscale"):
       inshape = tf.shape(inp)
       T, batch_size, dim = inshape[0], inshape[1], inshape[2]
@@ -358,7 +357,7 @@ class NLCModel(object):
     input_feed = {}
     input_feed[self.encoder_output] = encoder_output
     input_feed[self.target_tokens] = target_tokens
-    input_feed[self.target_mask] = target_mask if target_mask else np.ones_like(target_tokens)
+    input_feed[self.target_mask] = target_mask if target_mask is not None else np.ones_like(target_tokens)
     input_feed[self.keep_prob] = 1.
 
     if not decoder_states:
