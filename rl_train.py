@@ -59,7 +59,7 @@ vocab, rev_vocab = None, None
 lm = None
 
 
-def create_model(session, vocab_size, forward_only, model_name):
+def create_model(vocab_size, forward_only, model_name):
     model = nlc_model.NLCModel(
         vocab_size, FLAGS.size, FLAGS.num_layers, FLAGS.max_gradient_norm, FLAGS.batch_size,
         FLAGS.learning_rate, FLAGS.learning_rate_decay_factor, FLAGS.dropout, FLAGS,
@@ -80,6 +80,15 @@ def initialize_models(session, model):
         session.run(tf.global_variables_initializer())
         logging.info('Num params: %d' % sum(v.get_shape().num_elements() for v in tf.trainable_variables()))
 
+def restore_models(session, model):
+    ckpt = tf.train.get_checkpoint_state(FLAGS.train_dir)
+    v2_path = ckpt.model_checkpoint_path + ".index" if ckpt else ""
+    if ckpt and (tf.gfile.Exists(ckpt.model_checkpoint_path) or tf.gfile.Exists(v2_path)):
+        logging.info("Reading model parameters from %s" % ckpt.model_checkpoint_path)
+        model.saver.restore(session, ckpt.model_checkpoint_path)
+        return True
+    else:
+        return False
 
 def validate(model, sess, x_dev, y_dev):
     valid_costs, valid_lengths = [], []
@@ -438,79 +447,208 @@ def decode_greedy_batch(model, sess, encoder_output, batch_size):
         decoder_input = token_highest_prob.reshape([1, batch_size])
         i += 1
 
-        print(token_highest_prob)
-        print("turn %d" % i)
-
     return output_sent
 
 
-# TODO: maybe test this, but should work fine
+# TODO: test this with newly trained model!
 def decompose_reward(a, b):
     # a is ground truth, both are tokenized with padding
     # return shape: (time,)
     reward_hist = np.zeros((FLAGS.max_seq_len), dtype=np.float32)
     reward_gain = np.zeros((FLAGS.max_seq_len), dtype=np.float32)
-    print(a)
+    if b.size == 0:
+        return reward_gain
     for i in range(1, FLAGS.max_seq_len):
-        reward_hist[i] = compute_cer(a[:i], b[:i])
-    print(b)
-    print(reward_hist)
+        reward = 1 - compute_cer(np.array_str(a[:i]), np.array_str(b[:i]))
+        reward_hist[i] = 0 if reward <= 0 else reward
     reward_gain[1:] = np.diff(reward_hist)  # first reward is always 0
-    print(reward_gain)
     return reward_gain
 
 
-# TODO: can we turn this into a generator?
+def clip_after_eos(a, no_eos=False):
+    # take in a 1-dim np array, this pads as well
+    # mask_nonzero + 1 means we want to keep <EOS>
+    # mask_nonzero means we don't want <EOS>
+    # no_eos: we don't add eos, this option is for decode() function, not for beam_decode()
+    mask = a == nlc_data.EOS_ID
+    mask_nonzero = mask.nonzero()[0].tolist()  # only want the first EOS
+    if len(mask_nonzero) != 0:  # sometimes it didn't generate an EOS...
+        pos = mask_nonzero[0] if no_eos else mask_nonzero[0] + 1
+        a[pos:a.shape[0]] = nlc_data.PAD_ID  # pad it
+    return a
+
+
 def process_samples(sess, actor, x, y):
     # this batch things together based on the batch size
     # in the end, we can just izip the arrays, and iterate on them
-    rewards, actions_dist, actions = [], [], []
-    source_tokenss, source_masks, target_tokenss, target_masks = [], [], [], []
+    rewards, actions_dist, actions, actions_mask = [], [], [], []
+    source_tokenss, target_tokenss = [], []
     # actions: (time, batch_size, vocab) # condition on ground truth targets
 
-    batches = []
+    # for universal padding, we can iterate through the dataset, and determine the
+    # optimal batch_max_len for each batch, then pass in
+    # batch_pads can be a list, we keep track of an iterator, and each turn just pass it in
 
+    # not adding sos eos to target_tokens
+    # Note: action_dist is [T, batch_size, vocab_size]
     for source_tokens, source_mask, target_tokens, target_mask in pair_iter(x, y, 1,
-                                                                            FLAGS.num_layers):
+                                                                            FLAGS.num_layers,
+                                                                            add_sos_eos_bool=False):
 
-        source_tokenss.append(source_tokens[0])
-        source_masks.append(source_mask[0])
-        target_tokenss.append(target_tokens)
-        target_masks.append(target_mask[0])
+        source_tokenss.append(np.squeeze(source_tokens).tolist())
+        target_tokenss.append(np.squeeze(target_tokens).tolist())
 
         encoder_output = actor.encode(sess, source_tokens, source_mask)
-        best_tok, tok_prob = decode_beam(actor, sess, encoder_output, 1)
-        best_str = detokenize(best_tok, rev_vocab)[0]  # greedy
+        best_tok, _ = decode_beam(actor, sess, encoder_output, 1)
+        best_tok[0][-1] = nlc_data.EOS_ID  # last data mark as EOS
+        padded_best_tok = padded(best_tok, depth=1, batch_pad=32)  # TODO: remember to switch to a univeral pad list
 
-        if best_str == "":
-            best_str = " "
+        # way to solve batch problem - pad best_tok!
 
-        best_str_tokens, best_str_mask = tokenize(best_str, vocab)
-        rewards.append(decompose_reward(target_tokens, best_str_tokens))
+        decoder_output, _, _ = actor.decode(sess, encoder_output, np.matrix(padded_best_tok).T)
 
-        actions.append(best_str_tokens)
-        actions_dist.append(tok_prob)
+        # decoder_output = np.squeeze(decoder_output)
 
-        if len(source_tokenss) % FLAGS.batch_size == 0:
-            batches.append((np.array(rewards), np.array(actions_dist), np.array(actions),
-                            np.array(source_tokenss), np.array(source_masks), np.array(target_tokenss),
-                            np.array(target_masks)))
+        tok_highest_prob = np.argmax(np.squeeze(decoder_output), axis=1)
+        # clipped_tok_highest_prob = clip_after_eos(tok_highest_prob)  # hmmm, not sure if we should clip after eos
+        clipped_tok_highest_prob = tok_highest_prob
+
+        # print("token with highest prob: ")
+        # print(clipped_tok_highest_prob)
+        # print("target toks: ")
+        # print(np.squeeze(target_tokens))
+
+        # TODO: test reward :(
+        reward = decompose_reward(np.squeeze(target_tokens), clipped_tok_highest_prob)
+        # print(reward)
+        rewards.append(reward)
+
+        # need to pad actions and make masks...
+        # print("action shape: %s" % (best_tok.shape,))
+        # print(best_tok[0])
+        # print("action dist shape: %s" % (tok_prob.shape,))
+
+        # print("token len: {}".format(clipped_tok_highest_prob.shape))
+        # print("target len: {}".format(target_tokens.shape))
+        # print("action dist shape: {}".format(decoder_output.shape))
+
+        actions.append(clipped_tok_highest_prob)
+        actions_dist.append(decoder_output)
+
+        if len(rewards) % FLAGS.batch_size == 0:
+            # padding problem solved!!
+            batch = (np.array(rewards), np.concatenate(actions_dist, axis=1), np.array(actions))
+
+            # notice the transpose for source, not for target
+            # notice no sos_eos for target!
+            x_padded = np.array(padded(source_tokenss, FLAGS.num_layers)).T
+            source_masks = (x_padded != nlc_data.PAD_ID).astype(np.int32)
+            y_padded = np.array(padded(target_tokenss, 1))
+            target_masks = (y_padded != nlc_data.PAD_ID).astype(np.int32)
+
+            batch += (x_padded, source_masks, y_padded, target_masks)
+
             rewards, actions_dist, actions = [], [], []
-            source_tokenss, source_masks, target_tokenss, target_masks = [], [], [], []
+            source_tokenss, target_tokenss = [], []
 
-        break
+            yield batch
 
     # for residuals
-    batches.append((np.array(rewards), np.array(actions_dist), np.array(actions),
-                    np.array(source_tokenss), np.array(source_masks), np.array(target_tokenss),
-                    np.array(target_masks)))
-    return batches
+    x_padded = np.array(padded(source_tokenss, FLAGS.num_layers)).T
+    source_masks = (x_padded != nlc_data.PAD_ID).astype(np.int32)
+    y_padded = np.array(padded(target_tokenss, 1))
+    target_masks = (y_padded != nlc_data.PAD_ID).astype(np.int32)
+
+    yield (np.array(rewards), np.concatenate(actions_dist, axis=1), np.array(actions),
+           x_padded, source_masks, y_padded, target_masks)
+
+    return
+
+def setup_loss_critic(critic):
+    # we are starting with critic.outputs symbol (after logistic layer)
+    with tf.variable_scope("critic_update", initializer=tf.uniform_unit_scaling_initializer(1.0)):
+        # loss setup
+        # None to timestep
+        critic.target_qt = tf.placeholder(tf.float32, shape=[None, None, critic.vocab_size],
+                                            name="q_action_score")
+        # p_actions is the target_token, and it's already [T, batch_size]
+        # q_t needs to be expanded...
+
+        # critic.outputs [T, batch_size, vocab_size]
+        # let's populate (expand) target tokens to fill up qt (just like what we did with one-hot labels)
+
+        # q_action_score = tf.gather_nd(critic.outputs, critic.target_tokens)
+        critic.q_loss = tf.reduce_sum(tf.square(critic.outputs - critic.target_qt))  # Note: not adding lambda*C yet (variance)
+
+        opt = nlc_model.get_optimizer(FLAGS.optimizer)(critic.learning_rate)
+
+        # update
+        params = tf.trainable_variables()
+        gradients = tf.gradients(critic.q_loss, params)
+        clipped_gradients, _ = tf.clip_by_global_norm(gradients, FLAGS.max_gradient_norm)
+        #      self.gradient_norm = tf.global_norm(clipped_gradients)
+        critic.gradient_norm = tf.global_norm(gradients)
+        critic.param_norm = tf.global_norm(params)
+        critic.updates = opt.apply_gradients(
+            zip(clipped_gradients, params), global_step=critic.global_step)
 
 
-# TODO: one of the central problem/question is that BLEU is a post-op measure
-# TODO: in order to improve, we must do beam-search on the fly
-def pretrain_critic(sess, actor, critic, delayed_actor, target_critic,
-                    x_dev, y_dev, x_train, y_train):
+def update_critic(sess, critic, q_values, p_actions, source_tokens, source_mask, target_mask=None):
+    # similar to model.train() method!
+    # note that we take out the target_masks (only used in setup_loss)
+    # p_actions is the "target_tokens" (it's not action_dist)
+    input_feed = {}
+    input_feed[critic.source_tokens] = source_tokens
+    input_feed[critic.source_mask] = source_mask
+    input_feed[critic.target_tokens] = p_actions
+    input_feed[critic.target_mask] = target_mask if target_mask is not None else np.ones_like(p_actions)
+
+    one_hot_qt = tf.one_hot(p_actions, depth=critic.vocab_size).eval(feed_dict={},session=sess)
+    target_qt = np.expand_dims(q_values, axis=2) * one_hot_qt
+    input_feed[critic.target_qt] = target_qt  # [T, batch_size, vocab_size]
+    # so now target_qt becomes one-hot encoding, but not with 1, but the target q at each position
+    # after expanding dimension, it can broadcast multiply
+    # TODO: make sure this part is correct though...loss is huge!!
+    # TODO: maybe it's the "rewards" problem (reward is too big)
+    # TODO: maybe gradient clipping is NOT working!
+
+    # grad_norm: 3.58035e+06  211872.0
+    # cost: 1.31738e+08   150043.0 (one-hot vector)
+    # param_norm: 72.1753
+
+    input_feed[critic.keep_prob] = critic.keep_prob_config
+    critic.set_default_decoder_state_input(input_feed, p_actions.shape[1])
+
+    output_feed = [critic.updates, critic.gradient_norm, critic.q_loss, critic.param_norm]
+
+    outputs = sess.run(output_feed, input_feed)
+
+    return outputs[1], outputs[2], outputs[3]
+
+def setup_actor_update(actor):
+    actor.critic_output = tf.placeholder(tf.float32, shape=[None, None, actor.vocab_size], name='critic_output')
+    opt = nlc_model.get_optimizer(FLAGS.optimizer)(actor.learning_rate)
+
+    # update
+    params = tf.trainable_variables()
+    gradients = tf.gradients(actor.losses, params)
+    clipped_gradients, _ = tf.clip_by_global_norm(gradients, FLAGS.max_gradient_norm)
+
+    # clip, then multiply, otherwise we are not learning the signals from critic
+    # clipped_gradients: [T, batch_size, vocab_size]
+    updated_gradients = clipped_gradients * actor.critic_output  # step 7: update
+
+    actor.rl_gradient_norm = tf.global_norm(updated_gradients)
+    actor.rl_param_norm = tf.global_norm(params)
+
+    actor.rl_updates = opt.apply_gradients(
+        zip(updated_gradients, params), global_step=actor.global_step)
+
+def update_actor(sess, critic, q_values, p_actions, source_tokens, source_mask, target_mask=None):
+    pass
+
+def train_critic(sess, actor, critic, delayed_actor, target_critic,
+                 x_dev, y_dev, x_train, y_train, pretrain=False):
     # since actor is fixed, we can generate our own y_dev, y_train
     # use it to train such actor
     # for now...we encode at each turn (might be inefficient)
@@ -520,10 +658,50 @@ def pretrain_critic(sess, actor, critic, delayed_actor, target_critic,
     # TODO: 5. continue with Algorithm 1
     # possible to batch since we don't need beam-decode
 
-    batches = process_samples(sess, actor, x_train, y_train)
+    i = 0
 
-    # q = rewards + np.sum(self.delayed_policy.f_output(observations) *
-    #                      self.target_critic.compute_reward_sa(observations, actions), axis=2)
+    # it's generating different source_tokens if we update our actor
+    # NOTE: we are using delayed_actor p' to generate a sequence of actions
+    for rewards, actions_dist, actions, source_tokens, \
+        source_mask, target_tokens, target_mask in process_samples(sess, delayed_actor, x_train, y_train):
+
+        # print(i)
+        # print("%r %r %r" % (rewards.shape, source_tokens.shape, source_mask.shape))
+
+        # action_dist = [T, batch_size, vocab_size]
+        # rewards = [batch_size, T]
+        # actions = [batch_size, T]  # remember target_tokens shape is [T, batch_size]
+        # source_tokens = [T, batch_size]
+        # target_tokens = [batch_size, T]
+
+        # remember target_tokens here is NOT transposed
+
+        # step 5
+        critic_encoder_output = target_critic.encode(sess, target_tokens.T, target_mask.T)  # condition on ground truth
+        critic_scores, _, _ = target_critic.decode(sess, critic_encoder_output, actions.T)  # actions needs to be transposed
+        # print(critic_scores.shape) - assume it's [T, batch_size, vocab_size]
+
+        q_values = rewards.T + np.sum(actions_dist * critic_scores, axis=2)
+        # q_values shape: (32, 4)
+
+        grad_norm, cost, param_norm = update_critic(sess, critic, q_values, actions.T, source_tokens, source_mask)
+        print(grad_norm)
+        print(cost)
+        print(param_norm)
+
+        # TODO: apply the graidnet (what's the shape of the gradient for actor model!?)
+        # TODO: it needs to be aligned with critic's output... (batch_size, time_step, vocab_size)
+
+        if not pretrain:
+            # if not pretrain, we stop using a fixed actor...we update the actor as well
+            pass
+            # TODO: actor update (gradient might be wrong..or messed up)
+            # update delayed_actor and target_critic
+
+        # TODO: another check is...the tf.assign(), does it "decouple" and only assign the value?
+        # TODO: or does it just do reference assign...
+
+        sys.exit(0)
 
 
 
@@ -567,21 +745,29 @@ def train():
     with tf.Session() as sess:
         print("Creating %d layers of %d units." % (FLAGS.num_layers, FLAGS.size))
         with tf.variable_scope("actor") as actor_vs:
-            model = create_model(sess, vocab_size, False, actor_vs.name)
+            model = create_model(vocab_size, False, actor_vs.name)
+            # setup_actor_update(model)
         with tf.variable_scope("critic") as critic_vs:
-            critic = create_model(sess, vocab_size, False, critic_vs.name)
+            critic = create_model(vocab_size, False, critic_vs.name)
+            setup_loss_critic(critic)
         with tf.variable_scope("delayed_actor") as delayed_actor_vs:
-            delayed_actor = create_model(sess, vocab_size, False, delayed_actor_vs.name)
+            delayed_actor = create_model(vocab_size, False, delayed_actor_vs.name)
+            # setup_actor_update(model)
         with tf.variable_scope("target_critic") as target_critic_vs:
-            target_critic = create_model(sess, vocab_size, False, target_critic_vs.name)
+            target_critic = create_model(vocab_size, False, target_critic_vs.name)
+            setup_loss_critic(target_critic)
 
-        initialize_models(sess, model)
+        # if there is not model to restore, we initialize all of them
+        # otherwise, we only need to restore ONCE for everything.
+        if not restore_models(sess, model):
+            initialize_models(sess, model)
+            initialize_models(sess, delayed_actor)
+            initialize_models(sess, critic)
+            initialize_models(sess, target_critic)
 
         # by doing this, we are assigning embeddings as well
         # thinking about how critic's embeddings can make sense
         actor_variables = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=actor_vs.name)
-        # for v in actor_variables:
-        #     print(v.name)
         delayed_actor_variables = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=delayed_actor_vs.name)
         critic_variables = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=critic_vs.name)
         target_critic_variables = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=target_critic_vs.name)
@@ -592,13 +778,16 @@ def train():
         # assign model's parameter values to delayed_actor
         set_params_values(actor_variables, delayed_actor_variables, sess, "actor", "delayed_actor")
 
+        # assign critic's initial parameter values to target_critic
+        set_params_values(critic_variables, target_critic_variables, sess, "critic", "target_critic")
+
         if not FLAGS.sup_only:
             # TODO: 2. actor (policy) is just the first seq2seq, build critic (2nd seq2seq)
             # TODO:    write training procedure for pretraining critic
 
             # pre-train critic
-            pretrain_critic(sess, model, critic, delayed_actor, target_critic,
-                            x_dev, y_dev, x_train, y_train)
+            train_critic(sess, model, critic, delayed_actor, target_critic,
+                         x_dev, y_dev, x_train, y_train)
 
             # TODO: 3. write Algorithm 1 in paper
 

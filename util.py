@@ -23,13 +23,17 @@ from six.moves import xrange
 import tensorflow as tf
 import random
 
+from joblib.pool import MemmapingPool
+import multiprocessing as mp
+import pyprind
+
 
 FLAGS = tf.app.flags.FLAGS
 
 def tokenize(string):
   return [int(s) for s in string.split()]
 
-def pair_iter(fnamex, fnamey, batch_size, num_layers, sort_and_shuffle=True):
+def pair_iter(fnamex, fnamey, batch_size, num_layers, sort_and_shuffle=True, add_sos_eos_bool=True, batch_pad=0):
   fdx, fdy = open(fnamex), open(fnamey)
   batches = []
 
@@ -40,12 +44,12 @@ def pair_iter(fnamex, fnamey, batch_size, num_layers, sort_and_shuffle=True):
       break
 
     x_tokens, y_tokens = batches.pop(0)
-    y_tokens = add_sos_eos(y_tokens)
+    y_tokens = add_sos_eos(y_tokens) if add_sos_eos_bool else map(lambda token_list: token_list + [nlc_data.EOS_ID, nlc_data.PAD_ID], y_tokens)
     x_padded, y_padded = padded(x_tokens, num_layers), padded(y_tokens, 1)
 
     source_tokens = np.array(x_padded).T
     source_mask = (source_tokens != nlc_data.PAD_ID).astype(np.int32)
-    target_tokens = np.array(y_padded).T
+    target_tokens = np.array(y_padded).T  # (batch_size, time_step) # (time_step, batch_size)
     target_mask = (target_tokens != nlc_data.PAD_ID).astype(np.int32)
 
     yield (source_tokens, source_mask, target_tokens, target_mask)
@@ -81,8 +85,8 @@ def refill(batches, fdx, fdy, batch_size, sort_and_shuffle=True):
 def add_sos_eos(tokens):
   return map(lambda token_list: [nlc_data.SOS_ID] + token_list + [nlc_data.EOS_ID], tokens)
 
-def padded(tokens, depth):
-  maxlen = max(map(lambda x: len(x), tokens))
+def padded(tokens, depth, batch_pad=0):
+  maxlen = max(map(lambda x: len(x), tokens)) if batch_pad == 0 else batch_pad
   align = pow(2, depth - 1)
   padlen = maxlen + (align - maxlen) % align
   return map(lambda token_list: token_list + [nlc_data.PAD_ID] * (padlen - len(token_list)), tokens)
@@ -97,3 +101,22 @@ def get_tokenizer(flags):
   else:
     raise()
 
+
+class ProgBarCounter(object):
+    def __init__(self, total_count):
+        self.total_count = total_count
+        self.max_progress = 1000000
+        self.cur_progress = 0
+        self.cur_count = 0
+        self.pbar = pyprind.ProgBar(self.max_progress)
+
+    def inc(self, increment):
+        self.cur_count += increment
+        new_progress = self.cur_count * self.max_progress / self.total_count
+        if new_progress < self.max_progress:
+            self.pbar.update(new_progress - self.cur_progress)
+        self.cur_progress = new_progress
+
+    def stop(self):
+        if self.pbar is not None and self.pbar.active:
+            self.pbar.stop()
