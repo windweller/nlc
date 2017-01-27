@@ -14,6 +14,7 @@ import itertools
 import numpy as np
 from six.moves import xrange
 import tensorflow as tf
+import tflearn
 
 import nlc_model
 import nlc_data
@@ -577,8 +578,7 @@ def setup_loss_critic(critic):
         # critic.outputs [T, batch_size, vocab_size]
         # let's populate (expand) target tokens to fill up qt (just like what we did with one-hot labels)
 
-        # q_action_score = tf.gather_nd(critic.outputs, critic.target_tokens)
-        critic.q_loss = tf.reduce_sum(tf.square(critic.outputs - critic.target_qt))  # Note: not adding lambda*C yet (variance)
+        critic.q_loss = tf.reduce_mean(tf.square(critic.outputs - critic.target_qt))  # Note: not adding lambda*C yet (variance)
 
         opt = nlc_model.get_optimizer(FLAGS.optimizer)(critic.learning_rate)
 
@@ -608,12 +608,12 @@ def update_critic(sess, critic, q_values, p_actions, source_tokens, source_mask,
     input_feed[critic.target_qt] = target_qt  # [T, batch_size, vocab_size]
     # so now target_qt becomes one-hot encoding, but not with 1, but the target q at each position
     # after expanding dimension, it can broadcast multiply
-    # TODO: make sure this part is correct though...loss is huge!!
+    # TODO: make sure this part is correct though...after reduce_mean, it's still kinda big...
     # TODO: maybe it's the "rewards" problem (reward is too big)
     # TODO: maybe gradient clipping is NOT working!
 
-    # grad_norm: 3.58035e+06  211872.0
-    # cost: 1.31738e+08   150043.0 (one-hot vector)
+    # grad_norm: 612.034
+    # cost: 22950.4
     # param_norm: 72.1753
 
     input_feed[critic.keep_prob] = critic.keep_prob_config
@@ -626,37 +626,46 @@ def update_critic(sess, critic, q_values, p_actions, source_tokens, source_mask,
     return outputs[1], outputs[2], outputs[3]
 
 def setup_actor_update(actor):
-    actor.critic_output = tf.placeholder(tf.float32, shape=[None, None, actor.vocab_size], name='critic_output')
+    # actor.critic_output = tf.placeholder(tf.float32, shape=[None, None, actor.vocab_size], name='critic_output')
+    actor.action_gradients = tf.placeholder(tf.float32, [None, None, actor.vocab_size], name='action_gradients')
+    # action_gradients is passed in by Q_network...
     opt = nlc_model.get_optimizer(FLAGS.optimizer)(actor.learning_rate)
 
     # update
     params = tf.trainable_variables()
-    gradients = tf.gradients(actor.losses, params)
+
+    # http://pemami4911.github.io/blog/2016/08/21/ddpg-rl.html (DDPG update)
+    gradients = tf.gradients(actor.losses, params, -actor.action_gradients)  # step 7: update
+    # Not sure if I understood this part lol
+
     clipped_gradients, _ = tf.clip_by_global_norm(gradients, FLAGS.max_gradient_norm)
 
     # clip, then multiply, otherwise we are not learning the signals from critic
     # clipped_gradients: [T, batch_size, vocab_size]
-    updated_gradients = clipped_gradients * actor.critic_output  # step 7: update
 
-    actor.rl_gradient_norm = tf.global_norm(updated_gradients)
+    # updated_gradients = clipped_gradients * actor.critic_output
+    # pass in as input
+
+    actor.rl_gradient_norm = tf.global_norm(clipped_gradients)
     actor.rl_param_norm = tf.global_norm(params)
 
     actor.rl_updates = opt.apply_gradients(
-        zip(updated_gradients, params), global_step=actor.global_step)
+        zip(clipped_gradients, params), global_step=actor.global_step)
 
-def update_actor(sess, critic, q_values, p_actions, source_tokens, source_mask, target_mask=None):
-    pass
+def update_actor(sess, actor, q_values, p_actions, source_tokens, source_mask, target_tokens, target_mask):
+    input_feed = {}
+    input_feed[actor.source_tokens] = source_tokens
+    input_feed[actor.source_mask] = source_mask
+    input_feed[actor.target_tokens] = target_tokens
+    input_feed[actor.target_mask] = target_mask
+
+
 
 def train_critic(sess, actor, critic, delayed_actor, target_critic,
                  x_dev, y_dev, x_train, y_train, pretrain=False):
     # since actor is fixed, we can generate our own y_dev, y_train
     # use it to train such actor
     # for now...we encode at each turn (might be inefficient)
-
-    # we need to save rewards
-
-    # TODO: 5. continue with Algorithm 1
-    # possible to batch since we don't need beam-decode
 
     i = 0
 
@@ -746,13 +755,13 @@ def train():
         print("Creating %d layers of %d units." % (FLAGS.num_layers, FLAGS.size))
         with tf.variable_scope("actor") as actor_vs:
             model = create_model(vocab_size, False, actor_vs.name)
-            # setup_actor_update(model)
+            setup_actor_update(model)
         with tf.variable_scope("critic") as critic_vs:
             critic = create_model(vocab_size, False, critic_vs.name)
             setup_loss_critic(critic)
         with tf.variable_scope("delayed_actor") as delayed_actor_vs:
             delayed_actor = create_model(vocab_size, False, delayed_actor_vs.name)
-            # setup_actor_update(model)
+            setup_actor_update(delayed_actor)
         with tf.variable_scope("target_critic") as target_critic_vs:
             target_critic = create_model(vocab_size, False, target_critic_vs.name)
             setup_loss_critic(target_critic)
@@ -760,10 +769,10 @@ def train():
         # if there is not model to restore, we initialize all of them
         # otherwise, we only need to restore ONCE for everything.
         if not restore_models(sess, model):
-            initialize_models(sess, model)
-            initialize_models(sess, delayed_actor)
-            initialize_models(sess, critic)
-            initialize_models(sess, target_critic)
+            initialize_models(sess, model)  # this should initialize all variables..
+            # initialize_models(sess, delayed_actor)
+            # initialize_models(sess, critic)
+            # initialize_models(sess, target_critic)
 
         # by doing this, we are assigning embeddings as well
         # thinking about how critic's embeddings can make sense
