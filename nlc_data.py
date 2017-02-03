@@ -77,7 +77,7 @@ def get_nlc_train_set(directory):
   train_path = os.path.join(directory, "train")
   print (train_path + ".x.txt")
   print (train_path + ".y.txt")
-  if not (gfile.Exists(train_path +".x.txt") and gfile.Exists(train_path +".y.txt")):
+  if not (gfile.Exists(train_path +".x.txt") and gfile.Exists(train_path + ".y.txt")):
     corpus_file = maybe_download(directory, "nlc-train.tar",
                                  _NLC_TRAIN_URL)
     print("Extracting tar file %s" % corpus_file)

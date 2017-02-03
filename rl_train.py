@@ -23,6 +23,8 @@ import util
 from nlc_data import PAD_ID
 from util import padded, add_sos_eos, get_tokenizer, pair_iter
 
+from tensorflow.python.ops import rnn_cell
+
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -31,9 +33,10 @@ tf.app.flags.DEFINE_float("learning_rate", 0.0003, "Learning rate.")
 tf.app.flags.DEFINE_float("learning_rate_decay_factor", 0.95, "Learning rate decays by this much.")
 tf.app.flags.DEFINE_float("max_gradient_norm", 10.0, "Clip gradients to this norm.")
 tf.app.flags.DEFINE_float("dropout", 0.15, "Fraction of units randomly dropped on non-recurrent connections.")
+tf.app.flags.DEFINE_float("tau", 0.001, "Fraction of units randomly dropped on non-recurrent connections.")
 tf.app.flags.DEFINE_integer("batch_size", 128, "Batch size to use during training.")
 tf.app.flags.DEFINE_integer("epochs", 40, "Number of epochs to pre-train actor model.")
-tf.app.flags.DEFINE_integer("critic_epochs", 1, "Number of epochs to pre-train critic.")
+tf.app.flags.DEFINE_integer("critic_epochs", 30, "Number of epochs to pre-train critic model.")
 tf.app.flags.DEFINE_integer("rl_epochs", 1, "Number of epochs to train entire rl algorithm.")
 tf.app.flags.DEFINE_integer("size", 400, "Size of each model layer.")  # 400
 tf.app.flags.DEFINE_integer("num_layers", 3, "Number of layers in the model.")
@@ -49,6 +52,7 @@ tf.app.flags.DEFINE_string("evaluate", "CER", "BLEU / CER")
 tf.app.flags.DEFINE_integer("print_every", 1, "How many iterations to do per print.")
 tf.app.flags.DEFINE_integer("keep", 0, "How many checkpoints to keep, 0 indicates keep all.")
 tf.app.flags.DEFINE_bool("rl_only", False, "flag True to only train rl portion")
+tf.app.flags.DEFINE_bool("rl_new", False, "flag True to re-initialize rl model variables")
 tf.app.flags.DEFINE_bool("sup_only", False, "flag True to only train supervised portion")
 
 tf.app.flags.DEFINE_integer("beam_size", 8, "Size of beam.")
@@ -416,7 +420,6 @@ def decode_greedy(model, sess, encoder_output):
 
 
 # now batched, similar to rllab's style
-# TODO: might want to test this...(right now it seems to work!!!)
 def decode_greedy_batch(model, sess, encoder_output, batch_size):
     decoder_state = None
     decoder_input = np.array([nlc_data.SOS_ID, ] * batch_size, dtype=np.int32).reshape([1, batch_size])
@@ -490,11 +493,11 @@ def process_samples(sess, actor, x, y):
     # optimal batch_max_len for each batch, then pass in
     # batch_pads can be a list, we keep track of an iterator, and each turn just pass it in
 
-    # not adding sos eos to target_tokens
     # Note: action_dist is [T, batch_size, vocab_size]
+    # target_tokens now have SOS, EOS
     for source_tokens, source_mask, target_tokens, target_mask in pair_iter(x, y, 1,
                                                                             FLAGS.num_layers,
-                                                                            add_sos_eos_bool=False):
+                                                                            add_sos_eos_bool=True):
 
         source_tokenss.append(np.squeeze(source_tokens).tolist())
         target_tokenss.append(np.squeeze(target_tokens).tolist())
@@ -504,23 +507,23 @@ def process_samples(sess, actor, x, y):
         best_tok[0][-1] = nlc_data.EOS_ID  # last data mark as EOS
         padded_best_tok = padded(best_tok, depth=1, batch_pad=32)  # TODO: remember to switch to a univeral pad list
 
+        # best_tok has <SOS> and <EOS> now
         # way to solve batch problem - pad best_tok!
 
         decoder_output, _, _ = actor.decode(sess, encoder_output, np.matrix(padded_best_tok).T)
-
-        # decoder_output = np.squeeze(decoder_output)
 
         tok_highest_prob = np.argmax(np.squeeze(decoder_output), axis=1)
         # clipped_tok_highest_prob = clip_after_eos(tok_highest_prob)  # hmmm, not sure if we should clip after eos
         clipped_tok_highest_prob = tok_highest_prob
 
+        # print("beam token: {}".format(best_tok))
         # print("token with highest prob: ")
         # print(clipped_tok_highest_prob)
         # print("target toks: ")
         # print(np.squeeze(target_tokens))
 
         # TODO: test reward :(
-        reward = decompose_reward(np.squeeze(target_tokens), clipped_tok_highest_prob)
+        reward = decompose_reward(np.squeeze(target_tokens), np.array(best_tok[0], dtype=np.int32))
         # print(reward)
         rewards.append(reward)
 
@@ -567,7 +570,7 @@ def process_samples(sess, actor, x, y):
 
 def setup_loss_critic(critic):
     # we are starting with critic.outputs symbol (after logistic layer)
-    with tf.variable_scope("critic_update", initializer=tf.uniform_unit_scaling_initializer(1.0)):
+    with tf.variable_scope("rl", initializer=tf.uniform_unit_scaling_initializer(1.0)):
         # loss setup
         # None to timestep
         critic.target_qt = tf.placeholder(tf.float32, shape=[None, None, critic.vocab_size],
@@ -615,7 +618,6 @@ def update_critic(sess, critic, q_values, p_actions, source_tokens, source_mask,
     # grad_norm: 612.034
     # cost: 22950.4
     # param_norm: 72.1753
-
     input_feed[critic.keep_prob] = critic.keep_prob_config
     critic.set_default_decoder_state_input(input_feed, p_actions.shape[1])
 
@@ -625,105 +627,222 @@ def update_critic(sess, critic, q_values, p_actions, source_tokens, source_mask,
 
     return outputs[1], outputs[2], outputs[3]
 
+
 def setup_actor_update(actor):
-    # actor.critic_output = tf.placeholder(tf.float32, shape=[None, None, actor.vocab_size], name='critic_output')
-    actor.action_gradients = tf.placeholder(tf.float32, [None, None, actor.vocab_size], name='action_gradients')
-    # action_gradients is passed in by Q_network...
-    opt = nlc_model.get_optimizer(FLAGS.optimizer)(actor.learning_rate)
 
-    # update
-    params = tf.trainable_variables()
+    with tf.variable_scope("rl"):
+        actor.critic_output = tf.placeholder(tf.float32, [None, None, actor.vocab_size], name='critic_output')
+        # action_gradients is passed in by Q_network...
+        # and in DDPG, it's the gradients of Q w.r.t. policy's chosen actions
+        # but in AC, it's the output of Q network w.r.t. all actions
+        opt = nlc_model.get_optimizer(FLAGS.optimizer)(actor.learning_rate)
 
-    # http://pemami4911.github.io/blog/2016/08/21/ddpg-rl.html (DDPG update)
-    gradients = tf.gradients(actor.losses, params, -actor.action_gradients)  # step 7: update
-    # Not sure if I understood this part lol
+        # update
+        params = tf.trainable_variables()
 
-    clipped_gradients, _ = tf.clip_by_global_norm(gradients, FLAGS.max_gradient_norm)
+        # TODO: hope this would work
+        with tf.variable_scope("Loss"):
+            doshape = tf.shape(actor.decoder_output)
+            T, batch_size = doshape[0], doshape[1]
+            do2d = tf.reshape(actor.decoder_output, [-1, actor.size])
+            logits2d = rnn_cell._linear(do2d, actor.vocab_size, True, 1.0)
+            # outputs2d = tf.nn.log_softmax(logits2d)
 
-    # clip, then multiply, otherwise we are not learning the signals from critic
-    # clipped_gradients: [T, batch_size, vocab_size]
+            # apply Q-network's score here (similar to advantage function)
+            # 1. reshape critic_output like decoder_output (same shape anyway)
+            # TODO: hope this is correct
+            critic_do2d = tf.reshape(actor.critic_output, [-1, actor.vocab_size])  # should reshape according to critic
+            # 2. multiply this with actor's logitis
+            rl_logits2d = logits2d * critic_do2d
 
-    # updated_gradients = clipped_gradients * actor.critic_output
-    # pass in as input
+            # actor.outputs = tf.reshape(outputs2d, tf.pack([T, batch_size, actor.vocab_size]))
 
-    actor.rl_gradient_norm = tf.global_norm(clipped_gradients)
-    actor.rl_param_norm = tf.global_norm(params)
+            targets_no_GO = tf.slice(actor.target_tokens, [1, 0], [-1, -1])
+            masks_no_GO = tf.slice(actor.target_mask, [1, 0], [-1, -1])
+            # easier to pad target/mask than to split decoder input since tensorflow does not support negative indexing
+            labels1d = tf.reshape(tf.pad(targets_no_GO, [[0, 1], [0, 0]]), [-1])
+            mask1d = tf.reshape(tf.pad(masks_no_GO, [[0, 1], [0, 0]]), [-1])
+            losses1d = tf.nn.sparse_softmax_cross_entropy_with_logits(rl_logits2d, labels1d) * tf.to_float(mask1d)
+            losses2d = tf.reshape(losses1d, tf.pack([T, batch_size]))
 
-    actor.rl_updates = opt.apply_gradients(
-        zip(clipped_gradients, params), global_step=actor.global_step)
+            actor.rl_losses = tf.reduce_sum(losses2d) / tf.to_float(batch_size)
 
-def update_actor(sess, actor, q_values, p_actions, source_tokens, source_mask, target_tokens, target_mask):
+        # http://pemami4911.github.io/blog/2016/08/21/ddpg-rl.html (DDPG update)
+        gradients = tf.gradients(actor.rl_losses, params)  # step 7: update
+        # Not sure if I understood this part lol
+
+        clipped_gradients, _ = tf.clip_by_global_norm(gradients, FLAGS.max_gradient_norm)
+
+        # clip, then multiply, otherwise we are not learning the signals from critic
+        # clipped_gradients: [T, batch_size, vocab_size]
+
+        # updated_gradients = clipped_gradients * actor.critic_output
+        # pass in as input
+
+        actor.rl_gradient_norm = tf.global_norm(clipped_gradients)
+        actor.rl_param_norm = tf.global_norm(params)
+
+        actor.rl_updates = opt.apply_gradients(
+            zip(clipped_gradients, params), global_step=actor.global_step)
+
+def update_actor(sess, actor, critic_scores, source_tokens, source_mask, target_tokens, target_mask):
+    # need to transpose target_tokens and target_mask
     input_feed = {}
     input_feed[actor.source_tokens] = source_tokens
     input_feed[actor.source_mask] = source_mask
     input_feed[actor.target_tokens] = target_tokens
     input_feed[actor.target_mask] = target_mask
+    input_feed[actor.keep_prob] = actor.keep_prob_config
+    actor.set_default_decoder_state_input(input_feed, target_tokens.shape[1])  # is this necessary?
 
+    # critic_scores
+    input_feed[actor.critic_output] = critic_scores
+
+    # another problem: I don't have a RL loss for policy, should I track loss for original policy?
+    # possible answer: yeah, maybe! but adding losses here will make it compute loss
+    # might be inefficient.
+
+    # We can add original loss to here as well, if we decide to track it!
+    output_feed = [actor.rl_updates, actor.rl_losses, actor.rl_gradient_norm, actor.rl_param_norm]
+    # output_feed = [actor.losses]
+
+    outputs = sess.run(output_feed, input_feed)
+
+    return outputs[1], outputs[2], outputs[3]
 
 
 def train_critic(sess, actor, critic, delayed_actor, target_critic,
-                 x_dev, y_dev, x_train, y_train, pretrain=False):
+                 x_dev, y_dev, x_train, y_train, actor_variables, delayed_actor_variables, critic_variables,
+                         target_critic_variables, train_epochs=FLAGS.critic_epochs, tau=FLAGS.tau, pretrain=False):
     # since actor is fixed, we can generate our own y_dev, y_train
     # use it to train such actor
     # for now...we encode at each turn (might be inefficient)
 
-    i = 0
-
     # it's generating different source_tokens if we update our actor
     # NOTE: we are using delayed_actor p' to generate a sequence of actions
-    for rewards, actions_dist, actions, source_tokens, \
-        source_mask, target_tokens, target_mask in process_samples(sess, delayed_actor, x_train, y_train):
 
-        # print(i)
-        # print("%r %r %r" % (rewards.shape, source_tokens.shape, source_mask.shape))
+    epoch = 0
+    best_epoch = 0
+    critic_previous_losses = []
+    exp_cost = None
+    exp_length = None
+    exp_norm = None
+    # total_iters = 0
+    # start_time = time.time()
 
-        # action_dist = [T, batch_size, vocab_size]
-        # rewards = [batch_size, T]
-        # actions = [batch_size, T]  # remember target_tokens shape is [T, batch_size]
-        # source_tokens = [T, batch_size]
-        # target_tokens = [batch_size, T]
+    while (train_epochs == 0 or epoch < train_epochs):
+        current_step = 0
+        epoch += 1
+        sum_critic_loss = 0.
+        itr = 0.
 
-        # remember target_tokens here is NOT transposed
+        # Train
+        epoch_tic = time.time()
+        for rewards, actions_dist, actions, source_tokens, \
+            source_mask, target_tokens, target_mask in process_samples(sess, delayed_actor, x_train, y_train):
 
-        # step 5
-        critic_encoder_output = target_critic.encode(sess, target_tokens.T, target_mask.T)  # condition on ground truth
-        critic_scores, _, _ = target_critic.decode(sess, critic_encoder_output, actions.T)  # actions needs to be transposed
-        # print(critic_scores.shape) - assume it's [T, batch_size, vocab_size]
+            tic = time.time()
+            # print(i)
+            # print("%r %r %r" % (rewards.shape, source_tokens.shape, source_mask.shape))
 
-        q_values = rewards.T + np.sum(actions_dist * critic_scores, axis=2)
-        # q_values shape: (32, 4)
+            # action_dist = [T, batch_size, vocab_size]
+            # rewards = [batch_size, T]
+            # actions = [batch_size, T]  # remember target_tokens shape is [T, batch_size]
+            # source_tokens = [T, batch_size]
+            # target_tokens = [batch_size, T]
 
-        grad_norm, cost, param_norm = update_critic(sess, critic, q_values, actions.T, source_tokens, source_mask)
-        print(grad_norm)
-        print(cost)
-        print(param_norm)
+            # remember target_tokens here is NOT transposed
 
-        # TODO: apply the graidnet (what's the shape of the gradient for actor model!?)
-        # TODO: it needs to be aligned with critic's output... (batch_size, time_step, vocab_size)
+            # step 5
+            critic_encoder_output = target_critic.encode(sess, target_tokens.T, target_mask.T)  # condition on ground truth
+            critic_scores, _, _ = target_critic.decode(sess, critic_encoder_output, actions.T)  # actions needs to be transposed
+            # print(critic_scores.shape) - assume it's [T, batch_size, vocab_size]
 
-        if not pretrain:
-            # if not pretrain, we stop using a fixed actor...we update the actor as well
-            pass
-            # TODO: actor update (gradient might be wrong..or messed up)
-            # update delayed_actor and target_critic
+            q_values = rewards.T + np.sum(actions_dist * critic_scores, axis=2)
+            # q_values shape: (32, 4)
 
-        # TODO: another check is...the tf.assign(), does it "decouple" and only assign the value?
-        # TODO: or does it just do reference assign...
+            critic_grad_norm, critic_cost, critic_param_norm = update_critic(sess, critic, q_values, actions.T, source_tokens, source_mask)
+            sum_critic_loss += critic_cost
+            itr += 1
 
-        sys.exit(0)
+            # apply the graidnet (what's the shape of the gradient for actor model!?)
+            # it needs to be aligned with critic's output... (batch_size, time_step, vocab_size)
 
+            if not pretrain:
+                # if not pretrain, we stop using a fixed actor...we update the actor as well
+                update_actor(sess, actor, critic_scores, source_tokens, source_mask, target_tokens.T, target_mask.T)
+                # update delayed_actor when it's no longer fixed
+                set_params_values(actor_variables, delayed_actor_variables, sess, "actor", "delayed_actor", percentage=tau)
 
+            # update target_critic even when critic is learning (used to generate q_value)
+            set_params_values(critic_variables, target_critic_variables, sess, "critic", "target_critic", percentage=tau)
+
+            toc = time.time()
+            iter_time = toc - tic
+            current_step += 1
+
+            # collect statistics
+
+            lengths = np.sum(target_mask, axis=0)
+            mean_length = np.mean(lengths)
+            std_length = np.std(lengths)
+
+            if not exp_cost:
+                exp_cost = critic_cost
+                exp_length = mean_length
+                exp_norm = critic_grad_norm
+            else:
+                exp_cost = 0.99 * exp_cost + 0.01 * critic_cost
+                exp_length = 0.99 * exp_length + 0.01 * mean_length
+                exp_norm = 0.99 * exp_norm + 0.01 * critic_grad_norm
+
+            # TODO: another check is...the tf.assign(), does it "decouple" and only assign the value?
+            # TODO: or does it just do reference assign...
+
+            if current_step % FLAGS.print_every == 0:
+                print(
+                    'epoch %d, iter %d, cost %f, exp_cost %f, grad norm %f, param norm %f, batch time %f, length mean/std %f/%f' %
+                    (1, current_step, critic_cost, exp_cost / exp_length, critic_grad_norm, critic_param_norm, iter_time,
+                     mean_length,
+                     std_length))
+
+        epoch_toc = time.time()
+
+        ## Checkpoint
+        checkpoint_path = os.path.join(FLAGS.train_dir, "best.ckpt")
+
+        ## Validate
+        valid_cost = validate(actor, sess, x_dev, y_dev)
+
+        logging.info("Epoch %d Validation cost of model: %f time: %f" % (epoch, valid_cost, epoch_toc - epoch_tic))
+
+        avg_critic_loss = sum_critic_loss / itr
+
+        logging.info("Epoch %d avg cost of critic: %f" % (epoch, avg_critic_loss))
+
+        # rate annealing to critic's training_loss
+        if len(critic_previous_losses) > 2 and avg_critic_loss > critic_previous_losses[-1]:
+            logging.info("Annealing learning rate by %f" % FLAGS.learning_rate_decay_factor)
+            sess.run(critic.learning_rate_decay_op)
+            critic.saver.restore(sess, checkpoint_path + ("-%d" % best_epoch))
+        else:
+            critic_previous_losses.append(avg_critic_loss)
+            best_epoch = epoch
+            critic.saver.save(sess, checkpoint_path, global_step=epoch)
+
+    sys.stdout.flush()
 
 
 def set_params_values(source_params, target_params, sess, s_name, t_name, percentage=1.0, verbose=False):
     # assign source param values to target param values
     # tested, and works well!
+    # TODO: Test if this completely works by now
     assignments = []
 
     for s_p, t_p in itertools.izip(source_params, target_params):
         assert s_p.name.replace(s_name, "") == t_p.name.replace(t_name, "")
         assignments.append(
-            t_p.assign(s_p * percentage)
+            t_p.assign(s_p * percentage + t_p * (1 - percentage))
         )
     sess.run(assignments)
 
@@ -768,11 +887,9 @@ def train():
 
         # if there is not model to restore, we initialize all of them
         # otherwise, we only need to restore ONCE for everything.
+        # TODO: is this saving for critic even just for sup_only?
         if not restore_models(sess, model):
             initialize_models(sess, model)  # this should initialize all variables..
-            # initialize_models(sess, delayed_actor)
-            # initialize_models(sess, critic)
-            # initialize_models(sess, target_critic)
 
         # by doing this, we are assigning embeddings as well
         # thinking about how critic's embeddings can make sense
@@ -780,6 +897,23 @@ def train():
         delayed_actor_variables = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=delayed_actor_vs.name)
         critic_variables = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=critic_vs.name)
         target_critic_variables = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=target_critic_vs.name)
+
+        # initialized but untrained variables are NOT saved
+        # remove this code...
+        # if FLAGS.rl_new:
+            # actor_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=actor_vs.name)
+            # # filter down to Adam
+            # actor_vars = [v for v in actor_vars if "Adam_3" or "_power" in v.name]  #
+            #
+            # all_delayed_actor_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=delayed_actor_vs.name)
+            # all_critic_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=critic_vs.name)
+            # all_target_critic_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=target_critic_vs.name)
+            #
+            # sess.run([tf.variables_initializer(all_delayed_actor_vars),
+            #           tf.variables_initializer(all_critic_vars),
+            #           tf.variables_initializer(all_target_critic_vars),
+            #           tf.variables_initializer(actor_vars)])
+            # sess.run(tf.global_variables_initializer())
 
         if not FLAGS.rl_only:
             model = train_seq2seq(model, sess, x_dev, y_dev, x_train, y_train)  # pre-train actor
@@ -791,14 +925,19 @@ def train():
         set_params_values(critic_variables, target_critic_variables, sess, "critic", "target_critic")
 
         if not FLAGS.sup_only:
-            # TODO: 2. actor (policy) is just the first seq2seq, build critic (2nd seq2seq)
-            # TODO:    write training procedure for pretraining critic
 
+            print('Initial validation cost: %f' % validate(model, sess, x_dev, y_dev))
             # pre-train critic
             train_critic(sess, model, critic, delayed_actor, target_critic,
-                         x_dev, y_dev, x_train, y_train)
+                         x_dev, y_dev, x_train, y_train,
+                         actor_variables, delayed_actor_variables, critic_variables,
+                         target_critic_variables, train_epochs=FLAGS.critic_epochs, pretrain=True)
 
-            # TODO: 3. write Algorithm 1 in paper
+            # train actor-critic (for a given # of epoch?)
+            train_critic(sess, model, critic, delayed_actor, target_critic,
+                         x_dev, y_dev, x_train, y_train,
+                         actor_variables, delayed_actor_variables, critic_variables,
+                         target_critic_variables, train_epochs=FLAGS.rl_epochs, pretrain=True)
 
 
 def main(_):
