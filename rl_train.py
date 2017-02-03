@@ -937,7 +937,9 @@ def train():
             train_critic(sess, model, critic, delayed_actor, target_critic,
                          x_dev, y_dev, x_train, y_train,
                          actor_variables, delayed_actor_variables, critic_variables,
-                         target_critic_variables, train_epochs=FLAGS.rl_epochs, pretrain=True)
+                         target_critic_variables, train_epochs=FLAGS.rl_epochs, pretrain=False)
+
+        print('Final validation cost: %f' % validate(model, sess, x_dev, y_dev))
 
 
 def main(_):
