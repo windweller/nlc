@@ -523,6 +523,7 @@ def process_samples(sess, actor, x, y):
         # print(np.squeeze(target_tokens))
 
         # TODO: test reward :(
+        # TODO: if something is still not certain in this model, it's the reward
         reward = decompose_reward(np.squeeze(target_tokens), np.array(best_tok[0], dtype=np.int32))
         # print(reward)
         rewards.append(reward)
@@ -541,6 +542,7 @@ def process_samples(sess, actor, x, y):
 
         if len(rewards) % FLAGS.batch_size == 0:
             # padding problem solved!!
+            # TODO: concatenate failed (why?)
             batch = (np.array(rewards), np.concatenate(actions_dist, axis=1), np.array(actions))
 
             # notice the transpose for source, not for target
